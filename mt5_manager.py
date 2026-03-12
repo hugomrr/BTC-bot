@@ -1,73 +1,180 @@
+"""
+mt5_manager.py — Gestión de órdenes y cuenta en MT5
+
+Mejoras sobre la versión anterior:
+  - Control de spread antes de entrar (evita entrar en mercados ilíquidos)
+  - Control de slippage máximo (deviación)
+  - Reconexión automática si MT5 se desconecta
+  - Manejo explícito de None en symbol_info y symbol_info_tick
+  - Logs detallados de cada rechazo para poder diagnosticar
+"""
+import time
 import MetaTrader5 as mt5
 import logging
+import config
 
 logger = logging.getLogger("MT5Manager")
 
-class MT5TradeManager:
-    def __init__(self, symbol="BTCUSD"):
-        self.symbol = symbol
-        if not mt5.initialize():
-            logger.error(f"Fallo al iniciar MT5: {mt5.last_error()}")
 
-    def execute_trade(self, side, lot_size=0.01, stop_loss_points=5000, take_profit_points=10000):
-        """Ejecuta órdenes con SL y TP automáticos para proteger el capital."""
-        symbol_info = mt5.symbol_info(self.symbol)
-        if symbol_info is None:
-            logger.error(f"Símbolo {self.symbol} no encontrado.")
-            return None
-    # --- ARREGLO DE VOLUMEN (Nivel Ingeniero) ---
-        min_lot = symbol_info.volume_min
-        if lot_size < min_lot:
-            lot_size = min_lot
-            logger.warning(f"Ajustando volumen al mínimo permitido: {lot_size}")
-        # --------------------------------------------
+class MT5TradeManager:
+
+    def __init__(self, symbol: str = config.SYMBOL):
+        self.symbol = symbol
+        self._connect()
+
+    # ── Conexión ─────────────────────────────────────────────────────────────
+
+    def _connect(self) -> bool:
+        """Inicializa MT5. Devuelve True si tuvo éxito."""
+        if mt5.initialize():
+            info = mt5.account_info()
+            if info:
+                logger.info(
+                    f"✅ MT5 conectado | Cuenta: {info.login} | "
+                    f"Broker: {info.company} | Balance: {info.balance:.2f} {info.currency}"
+                )
+            return True
+        logger.error(f"❌ Fallo al iniciar MT5: {mt5.last_error()}")
+        return False
+
+    def ensure_connected(self) -> bool:
+        """Comprueba la conexión y reintenta si es necesario."""
+        if mt5.terminal_info() is not None:
+            return True
+        logger.warning("⚠️  MT5 desconectado. Intentando reconectar...")
+        time.sleep(config.MT5_RECONNECT_WAIT_SECONDS)
+        return self._connect()
+
+    # ── Utilidades ───────────────────────────────────────────────────────────
+
+    def _get_symbol_info(self):
+        info = mt5.symbol_info(self.symbol)
+        if info is None:
+            logger.error(f"Símbolo {self.symbol} no encontrado en MT5.")
+        return info
+
+    def _get_tick(self):
         tick = mt5.symbol_info_tick(self.symbol)
-        point = symbol_info.point 
-        price = tick.ask if side == 'buy' else tick.bid
-        
-        if side == 'buy':
-            sl = price - (stop_loss_points * point)
-            tp = price + (take_profit_points * point)
+        if tick is None:
+            logger.error(f"No se pudo obtener tick para {self.symbol}.")
+        return tick
+
+    def _spread_ok(self, symbol_info, tick) -> bool:
+        """Devuelve False si el spread actual supera el máximo configurado."""
+        spread_points = (tick.ask - tick.bid) / symbol_info.point
+        if spread_points > config.MAX_SPREAD_POINTS:
+            logger.warning(
+                f"⛔ Spread demasiado alto: {spread_points:.0f} pts "
+                f"(máx {config.MAX_SPREAD_POINTS}). Orden cancelada."
+            )
+            return False
+        return True
+
+    # ── Ejecución de órdenes ─────────────────────────────────────────────────
+
+    def execute_trade(self, side: str) -> object | None:
+        """
+        Ejecuta una orden de mercado con SL, TP y control de slippage.
+
+        Parámetros vienen de config.py para tener una única fuente de verdad.
+        Devuelve el resultado de mt5.order_send() o None si hay algún problema
+        previo al envío.
+        """
+        if not self.ensure_connected():
+            return None
+
+        symbol_info = self._get_symbol_info()
+        if symbol_info is None:
+            return None
+
+        tick = self._get_tick()
+        if tick is None:
+            return None
+
+        if not self._spread_ok(symbol_info, tick):
+            return None
+
+        # Ajuste de lote al mínimo permitido por el broker
+        lot = max(config.LOT_SIZE, symbol_info.volume_min)
+        point = symbol_info.point
+
+        if side == "buy":
+            price      = tick.ask
+            sl         = price - config.STOP_LOSS_POINTS   * point
+            tp         = price + config.TAKE_PROFIT_POINTS * point
             order_type = mt5.ORDER_TYPE_BUY
         else:
-            sl = price + (stop_loss_points * point)
-            tp = price - (take_profit_points * point)
+            price      = tick.bid
+            sl         = price + config.STOP_LOSS_POINTS   * point
+            tp         = price - config.TAKE_PROFIT_POINTS * point
             order_type = mt5.ORDER_TYPE_SELL
 
         request = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": self.symbol,
-            "volume": float(lot_size),
-            "type": order_type,
-            "price": price,
-            "sl": sl,
-            "tp": tp,
-            "magic": 202603,
-            "comment": "Bot Dios Protegido",
-            "type_time": mt5.ORDER_TIME_GTC,
+            "action":      mt5.TRADE_ACTION_DEAL,
+            "symbol":      self.symbol,
+            "volume":      float(lot),
+            "type":        order_type,
+            "price":       price,
+            "sl":          round(sl, symbol_info.digits),
+            "tp":          round(tp, symbol_info.digits),
+            "deviation":   config.MAX_SLIPPAGE_POINTS,  # Slippage máximo en puntos
+            "magic":       202603,
+            "comment":     "SniperBot v2",
+            "type_time":   mt5.ORDER_TIME_GTC,
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
 
+        logger.info(
+            f"📤 Enviando orden {side.upper()} | "
+            f"Precio: {price} | SL: {sl:.2f} | TP: {tp:.2f} | Lote: {lot}"
+        )
+
         result = mt5.order_send(request)
+
+        if result is None:
+            logger.error(f"mt5.order_send devolvió None. Error: {mt5.last_error()}")
+            return None
+
         if result.retcode != mt5.TRADE_RETCODE_DONE:
-            logger.error(f"Error en MT5: {result.comment} (Code: {result.retcode})")
-        else:
-            logger.info(f"✅ ¡Orden enviada! Ticket: {result.order}")
-        
+            logger.error(
+                f"❌ Orden rechazada | Código: {result.retcode} | "
+                f"Motivo: {result.comment}"
+            )
+            return None
+
+        logger.info(
+            f"✅ Orden ejecutada | Ticket: {result.order} | "
+            f"Precio real: {result.price}"
+        )
         return result
 
-    def get_account_summary(self):
-        """Obtiene el estado actual de la cuenta en Axi."""
-        account_info = mt5.account_info()
-        if account_info is None:
+    # ── Estado de cuenta ─────────────────────────────────────────────────────
+
+    def get_account_summary(self) -> str:
+        if not self.ensure_connected():
+            return "❌ MT5 desconectado. No se pudo obtener el balance."
+
+        info = mt5.account_info()
+        if info is None:
             return "❌ No se pudo obtener la info de la cuenta."
-        
-        summary = (
-            f"💰 **RESUMEN DE CUENTA**\n"
-            f"---------------------------\n"
-            f"• **Balance:** {account_info.balance:.2f} {account_info.currency}\n"
-            f"• **Equidad:** {account_info.equity:.2f}\n"
-            f"• **Margen Libre:** {account_info.margin_free:.2f}\n"
-            f"• **Beneficio Actual:** {account_info.profit:.2f}"
+
+        # Posiciones abiertas
+        positions = mt5.positions_get(symbol=self.symbol)
+        pos_text  = f"{len(positions)} abierta(s)" if positions else "Ninguna"
+
+        return (
+            f"💰 *RESUMEN DE CUENTA*\n"
+            f"{'─' * 28}\n"
+            f"• *Balance:*      `{info.balance:.2f} {info.currency}`\n"
+            f"• *Equidad:*      `{info.equity:.2f}`\n"
+            f"• *Margen libre:* `{info.margin_free:.2f}`\n"
+            f"• *P&L abierto:*  `{info.profit:.2f}`\n"
+            f"• *Posiciones:*   {pos_text}"
         )
-        return summary
+
+    def has_open_position(self) -> bool:
+        """Devuelve True si hay alguna posición abierta en el símbolo."""
+        if not self.ensure_connected():
+            return True  # Si no sé, asumo que hay posición (conservador)
+        positions = mt5.positions_get(symbol=self.symbol)
+        return positions is not None and len(positions) > 0
