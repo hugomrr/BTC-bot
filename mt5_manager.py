@@ -12,7 +12,7 @@ import time
 import MetaTrader5 as mt5
 import logging
 import config
-
+from datetime import datetime, timedelta
 logger = logging.getLogger("MT5Manager")
 
 
@@ -122,6 +122,9 @@ class MT5TradeManager:
             "comment":     "SniperBot v2",
             "type_time":   mt5.ORDER_TIME_GTC,
             "type_filling": mt5.ORDER_FILLING_IOC,
+          # Dentro del diccionario 'request' en execute_trade:
+            "magic":       config.MAGIC_NUMBER,
+            "comment":     config.BOT_NAME,
         }
 
         logger.info(
@@ -158,20 +161,36 @@ class MT5TradeManager:
         if info is None:
             return "❌ No se pudo obtener la info de la cuenta."
 
-        # Posiciones abiertas
-        positions = mt5.positions_get(symbol=self.symbol)
-        pos_text  = f"{len(positions)} abierta(s)" if positions else "Ninguna"
+        # Posiciones abiertas de ESTE bot
+        posiciones = mt5.positions_get(symbol=self.symbol)
+        pos_abiertas = [p for p in posiciones if p.magic == config.MAGIC_NUMBER] if posiciones else []
+        pos_text = f"{len(pos_abiertas)} abierta(s)"
+
+        # --- MAGIA QUANT: Calcular Beneficio Histórico de ESTE bot ---
+        hoy = datetime.now()
+        inicio_año = datetime(hoy.year, 1, 1) # Mira desde principio de año
+        
+        deals = mt5.history_deals_get(inicio_año, hoy + timedelta(days=1))
+        beneficio_bot = 0.0
+        trades_cerrados = 0
+
+        if deals is not None:
+            for deal in deals:
+                # Si el DNI coincide y es una operación de salida (cierre con profit)
+                if deal.magic == config.MAGIC_NUMBER and deal.symbol == self.symbol:
+                    beneficio_bot += deal.profit
+                    if deal.entry == mt5.DEAL_ENTRY_OUT: 
+                        trades_cerrados += 1
+        # -------------------------------------------------------------
 
         return (
-            f"💰 *RESUMEN DE CUENTA*\n"
+            f"🤖 *{config.BOT_NAME}* | Símbolo: {self.symbol}\n"
             f"{'─' * 28}\n"
-            f"• *Balance:*      `{info.balance:.2f} {info.currency}`\n"
-            f"• *Equidad:*      `{info.equity:.2f}`\n"
-            f"• *Margen libre:* `{info.margin_free:.2f}`\n"
-            f"• *P&L abierto:*  `{info.profit:.2f}`\n"
-            f"• *Posiciones:*   {pos_text}"
+            f"💰 *Balance Global:* `{info.balance:.2f} {info.currency}`\n"
+            f"📈 *P&L de ESTE bot:* `{beneficio_bot:+.2f} {info.currency}`\n"
+            f"🎯 *Tiros cerrados:* `{trades_cerrados}`\n"
+            f"🔫 *Balas en aire:* {pos_text}"
         )
-
     def has_open_position(self) -> bool:
         """Devuelve True si hay alguna posición abierta en el símbolo."""
         if not self.ensure_connected():
